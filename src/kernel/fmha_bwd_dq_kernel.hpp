@@ -45,7 +45,7 @@ __global__ void fmha_bwd_dq_kernel_wmma(
     __shared__ bhalf_t s_K[BK][BN + LDS_PAD];
 
     using FragA = rocwmma::fragment<rocwmma::matrix_a, 16, 16, 16, bhalf_t, rocwmma::row_major>;
-    using FragB = rocwmma::fragment<rocwmma::matrix_b, 16, 16, 16, bhalf_t, rocwmma::row_major>;
+    using FragB = rocwmma::fragment<rocwmma::matrix_b, 16, 16, 16, bhalf_t, rocwmma::col_major>;
     using FragC = rocwmma::fragment<rocwmma::accumulator, 16, 16, 16, float>;
     using FragOut = rocwmma::fragment<rocwmma::accumulator, 16, 16, 16, bhalf_t>;
 
