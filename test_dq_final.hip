@@ -48,9 +48,8 @@ __global__ void dq_kernel(
             __syncthreads();
 
             for (int sub = 0; sub < 2; ++sub) {
-                FragA a0, a1; FragB b0, b1;
+                FragA a0; FragB b0;
                 bhalf_t *a_ptr0 = reinterpret_cast<bhalf_t*>(&a0), *b_ptr0 = reinterpret_cast<bhalf_t*>(&b0);
-                bhalf_t *a_ptr1 = reinterpret_cast<bhalf_t*>(&a1), *b_ptr1 = reinterpret_cast<bhalf_t*>(&b1);
 
                 int n_off = sub * 16;
                 for (int i = 0; i < 16; ++i) {
@@ -59,7 +58,6 @@ __global__ void dq_kernel(
                         int n = n_start + n_off + j;
                         bhalf_t val = (m < BM && n < BN) ? s_dS[m][n] : bhalf_t(0.0f);
                         a_ptr0[i*16 + j] = val;
-                        a_ptr1[i*16 + j] = val;
                     }
                 }
                 for (int i = 0; i < 16; ++i) {
@@ -67,11 +65,9 @@ __global__ void dq_kernel(
                         int k = warp_k * 16 + j;
                         bhalf_t val = (k < BK && (n_off + i) < BN) ? s_K[k][n_off + i] : bhalf_t(0.0f);
                         b_ptr0[j*16 + i] = val;
-                        b_ptr1[j*16 + i] = val;
                     }
                 }
                 mma_sync(acc, a0, b0, acc);
-                mma_sync(acc, a1, b1, acc);
             }
         }
 

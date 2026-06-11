@@ -23,11 +23,18 @@ __global__ void fmha_bwd_dk_kernel_naive(const bhalf_t* dS, const bhalf_t* Q, bh
     dK[n * K_dim_global + k] = static_cast<bhalf_t>(sum);
 }
 
+// Convert float to bfloat16 (truncation, same as GPU)
+static inline bhalf_t float_to_bf16(float v) {
+    uint32_t fbits = __builtin_bit_cast(uint32_t, v); // C++23; fall back below
+    return static_cast<bhalf_t>((fbits >> 16));
+}
+
 int main() {
     const int M = 64, N = 64, K_dim = 32;
 
     bhalf_t h_dS[M*N], h_Q[M*K_dim];
-    float f_dk_ref[N*K_dim];
+    float f_dk_ref[N*K_dim]; // CPU ref as float (full precision)
+    bhalf_t bf16_dk_ref[N*K_dim]; // bfloat16-converted reference for comparison
 
     for (int i = 0; i < M*N; ++i) {
         h_dS[i] = static_cast<bhalf_t>(static_cast<float>(i) * 0.1f);
@@ -37,7 +44,7 @@ int main() {
         h_Q[i] = static_cast<bhalf_t>(val);
     }
 
-    // CPU ref: dK[n][k] = sum_m dS[m][n] * Q[m][k]
+    // CPU ref: dK[n][k] = sum_m dS[m][n] * Q[m][k], computed in float, stored as bfloat16
     for (int n = 0; n < N; ++n) {
         for (int k = 0; k < K_dim; ++k) {
             float sum = 0.0f;
@@ -46,6 +53,7 @@ int main() {
                        static_cast<float>(h_Q[m * K_dim + k]);
             }
             f_dk_ref[n * K_dim + k] = sum;
+            bf16_dk_ref[n * K_dim + k] = static_cast<bhalf_t>(sum); // bfloat16-quantized ref
         }
     }
 
@@ -70,12 +78,12 @@ int main() {
     int mismatches = 0;
     for (int i = 0; i < N * K_dim && mismatches < 16; ++i) {
         float gpu_val = static_cast<float>(h_result[i]);
-        float ref_val = f_dk_ref[i];
+        float ref_val = static_cast<float>(bf16_dk_ref[i]); // compare bfloat16-quantized ref
         float err = fabsf(gpu_val - ref_val);
         max_err = fmaxf(max_err, err);
-        if (err > 2.0f) {
+        if (err > 0.5f) { // tolerance: < 1 ULP in bfloat16
             int n = i / K_dim, k = i % K_dim;
-            printf("MISMATCH dK[%d][%d]: gpu=%.4f cpu=%.4f err=%.4f\n",
+            printf("MISMATCH dK[%d][%d]: gpu=%.4f ref_bf16=%.4f err=%.4f\n",
                    n, k, gpu_val, ref_val, err);
             mismatches++;
         }
@@ -83,7 +91,8 @@ int main() {
 
     int total_mismatches = 0;
     for (int i = 0; i < N * K_dim; ++i) {
-        if (fabsf(static_cast<float>(h_result[i]) - f_dk_ref[i]) > 2.0f) total_mismatches++;
+        if (fabsf(static_cast<float>(h_result[i]) - static_cast<float>(bf16_dk_ref[i])) > 2.0f)
+            total_mismatches++;
     }
 
     printf("\nNaive dK kernel: %d / %d mismatches, max_err=%.4f\n", total_mismatches, N*K_dim, max_err);

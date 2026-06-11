@@ -112,7 +112,7 @@ __global__ void dq_kernel(const bhalf_t* dS, const bhalf_t* K, bhalf_t* dQ,
     for (int i = tid; i < BM * BN; i += BLOCK_SIZE) {
         int m = i / BN, n = i % BN;
         int gm = m_start + m;
-        s_dS[m][n] = (gm < M_global && n < N_global) ? dS[gm * N_global + n] : half_t(0.0f);
+        s_dS[m][n] = (gm < M_global && n < N_global) ? dS[gm * N_global + n] : bhalf_t(0.0f);
     }
     __syncthreads();
 
@@ -207,7 +207,7 @@ __global__ void dk_kernel(const bhalf_t* dS, const bhalf_t* Q, bhalf_t* dK,
     for (int i = tid; i < BM * BN; i += BLOCK_SIZE) {
         int n_local = i / BM, m_local = i % BM;
         s_dS[n_local][m_local] = (n_start + n_local < N_global && m_local < M_global)
-                                 ? dS[m_local * N_global + n_start + n_local] : half_t(0.0f);
+                                 ? dS[m_local * N_global + n_start + n_local] : bhalf_t(0.0f);
     }
     __syncthreads();
 
@@ -309,7 +309,7 @@ __global__ void dv_kernel(const bhalf_t* P, const bhalf_t* dO, bhalf_t* dV,
     for (int i = tid; i < BM * BN; i += BLOCK_SIZE) {
         int n_local = i / BM, m_local = i % BM;
         s_P[n_local][m_local] = (n_start + n_local < N_global && m_local < M_global)
-                                ? P[m_local * N_global + n_start + n_local] : half_t(0.0f);
+                                ? P[m_local * N_global + n_start + n_local] : bhalf_t(0.0f);
     }
     __syncthreads();
 
