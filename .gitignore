@@ -1,4 +1,17 @@
+test_dk
+test_dk_debug
+test_dk_naive_check
+test_dk_unique
+test_dk_verify
 test_dp
 test_dq_final
 test_dq_reconstructed
+test_dv
+test_dv_compare
+test_dv_debug
+test_dv_direct
+test_dv_match
+test_dv_simple
 build/
+*.o
+*.so

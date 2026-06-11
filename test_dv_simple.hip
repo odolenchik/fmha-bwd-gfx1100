@@ -1,64 +1,55 @@
-#pragma once
 #include <hip/hip_runtime.h>
 #include <rocwmma/rocwmma.hpp>
-#include "fmha_bwd_config.h"
+#include <cstdio>
 
-using half_t = _Float16;
+using namespace rocwmma;
 using bhalf_t = rocwmma::bfloat16_t;
 
-// ============================================================
-// WMMA-optimized kernel: dV = P^T @ dO
-// (P[M x N])^T  x  dO[M x K_dim]  ->  N x K_dim (dV)
-// dV[n][k] = sum_{m=0}^{M-1} P[m][n] * dO[m][k]
-//
-// Tile layout: BN blocks along N, BK tiles along K_dim.
-// Uses the same WMMA pattern as dk_kernel (row_major FragA + col_major FragB).
-// ============================================================
+constexpr int BM = 64, BN = 64, BK = 32, LDS_PAD = 8, BLOCK_SIZE = 512;
 
+// dV kernel: inline copy to avoid external header dependency
 __global__ void fmha_bwd_dv_kernel_wmma(
-    const bhalf_t* P,       // [M x N] row-major (attention weights)
+    const bhalf_t* P,       // [M x N] row-major
     const bhalf_t* dO,      // [M x K_dim] row-major
     bhalf_t* dV,            // [N x K_dim] row-major
     int M_global, int N_global, int K_dim_global)
 {
-    __shared__ bhalf_t s_P[BN][BM + LDS_PAD];   // transposed: s_P[n_local][m_local] = P[m_local][n_start+n_local]
-    __shared__ bhalf_t s_dO[BK+LDS_PAD][BM];    // dO slice: s_dO[k_idx_local][m_idx]
+    __shared__ bhalf_t s_P[BN][BM + LDS_PAD];
+    __shared__ bhalf_t s_dO[BK+LDS_PAD][BM];
 
-    using FragA = rocwmma::fragment<rocwmma::matrix_a, 16, 16, 16, bhalf_t, rocwmma::row_major>;
-    using FragB = rocwmma::fragment<rocwmma::matrix_b, 16, 16, 16, bhalf_t, rocwmma::col_major>;
-    using FragC = rocwmma::fragment<accumulator, 16, 16, 16, float>;
-    using FragOut = rocwmma::fragment<accumulator, 16, 16, 16, bhalf_t>;
+    using FragA = fragment<matrix_a, 16, 16, 16, bhalf_t, row_major>;
+    using FragB = fragment<matrix_b, 16, 16, 16, bhalf_t, col_major>;
+    using FragC = fragment<accumulator, 16, 16, 16, float>;
+    using FragOut = fragment<accumulator, 16, 16, 16, bhalf_t>;
 
-    int block_n = blockIdx.x;      // which N tile (BN=64)
-    int block_k = blockIdx.y;      // which K_dim tile (BK=32)
+    int block_n = blockIdx.x;
+    int block_k = blockIdx.y;
 
     int tid = threadIdx.x;
-    int warp_id   = tid / WARP_SIZE;     // 0..7
-    int warp_n_idx = warp_id % 4;        // N sub-tile (16-wide each, 4 across)
-    int warp_k_idx = warp_id / 4;        // K sub-tile (16-wide each, 2 down)
+    int warp_id   = tid / 64;
+    int warp_n_idx = warp_id % 4;
+    int warp_k_idx = warp_id / 4;
 
-    int n_start = block_n * BN;      // starting column in P, row in dV
-    int k_start = block_k * BK;      // starting column in dO and dV
+    int n_start = block_n * BN;
+    int k_start = block_k * BK;
     int w_n_start = n_start + warp_n_idx * 16;
     int w_k_start = k_start + warp_k_idx * 16;
 
-    // ---- Load P transposed into shared memory: s_P[n][m] = P[m][n] ----
-    for (int i = tid; i < BM * BN; i += BLOCK_SIZE) {
-        int n_local = i / BM, m_local = i % BM;  // [BN x BM] layout
+    // Load P transposed: s_P[n][m] = P[m][n]
+    for (int i = tid; i < BM * BN; i += blockDim.x) {
+        int n_local = i / BM, m_local = i % BM;
         s_P[n_local][m_local] = (n_start + n_local < N_global && m_local < M_global)
-                                ? P[m_local * N_global + n_start + n_local] : half_t(0.0f);
+                                ? P[m_local * N_global + n_start + n_local] : _Float16(0.0f);
     }
     __syncthreads();
 
-    // ---- WMMA accumulate: dV_tile = P^T @ dO  (loop over M in BM chunks) ----
     FragC acc;
     rocwmma::fill_fragment(acc, 0.0f);
 
     for (int m_start = 0; m_start < M_global; m_start += BM) {
         int m_chunk = (BM < M_global - m_start) ? BM : (M_global - m_start);
 
-        // Load dO slice into shared memory: s_dO[k_idx_local][m_idx] = dO[m_idx][k_start+k_idx]
-        for (int i = tid; i < BK * m_chunk; i += BLOCK_SIZE) {
+        for (int i = tid; i < BK * m_chunk; i += blockDim.x) {
             int k_local = i / m_chunk, m_idx = i % m_chunk;
             s_dO[k_local][m_idx] = (k_start + k_local < K_dim_global && m_start + m_idx < M_global)
                                    ? dO[(m_start + m_idx) * K_dim_global + k_start + k_local]
@@ -66,7 +57,6 @@ __global__ void fmha_bwd_dv_kernel_wmma(
         }
         __syncthreads();
 
-        // WMMA: process 16x16 sub-tiles over M dimension (BM=64 → 4 iterations of 16)
         for (int m_sub = 0; m_sub < 4; ++m_sub) {
             FragA a_frag;
             FragB b_frag;
@@ -76,7 +66,6 @@ __global__ void fmha_bwd_dv_kernel_wmma(
 
             int m_off = m_sub * 16;
 
-            // Fill A fragment from P^T (row-major: n=rows, m=cols)
             for (int i = 0; i < 16; ++i) {
                 int n_local = warp_n_idx * 16 + i;
                 for (int j = 0; j < 16 && (m_off + j) < m_chunk; ++j) {
@@ -86,7 +75,6 @@ __global__ void fmha_bwd_dv_kernel_wmma(
                 }
             }
 
-            // Fill B fragment from dO slice (col-major transpose for WMMA matrix_b layout)
             for (int i = 0; i < 16 && (m_off + i) < m_chunk; ++i) {
                 for (int j = 0; j < 16; ++j) {
                     int k_idx_local = warp_k_idx * 16 + j;
@@ -100,7 +88,6 @@ __global__ void fmha_bwd_dv_kernel_wmma(
         }
     }
 
-    // ---- Write back results: dV[n][k] from accumulator ----
     if (w_n_start < N_global && w_k_start < K_dim_global) {
         FragOut out;
         for (int i = 0; i < acc.num_elements; ++i) {
@@ -116,4 +103,37 @@ __global__ void fmha_bwd_dv_kernel_wmma(
             }
         }
     }
+}
+
+int main() {
+    const int M = 64, N = 64, K_dim = 32;
+
+    bhalf_t h_P[M*N], h_dO[M*K_dim];
+    for (int i = 0; i < M*N; ++i) h_P[i] = static_cast<bhalf_t>(1.0f);
+    for (int i = 0; i < M*K_dim; ++i) h_dO[i] = static_cast<bhalf_t>(-0.5f);
+
+    bhalf_t *d_P, *d_dO, *d_result;
+    hipMalloc(&d_P, M*N*sizeof(bhalf_t));
+    hipMalloc(&d_dO, M*K_dim*sizeof(bhalf_t));
+    hipMalloc(&d_result, N*K_dim*sizeof(bhalf_t));
+
+    hipMemcpy(d_P, h_P, M*N*sizeof(bhalf_t), hipMemcpyHostToDevice);
+    hipMemcpy(d_dO, h_dO, M*K_dim*sizeof(bhalf_t), hipMemcpyHostToDevice);
+
+    dim3 grid((N + BN - 1) / BN, (K_dim + BK - 1) / BK);
+    printf("Grid: %d x %d, Block: %d\n", grid.x, grid.y, BLOCK_SIZE);
+
+    hipLaunchKernelGGL(fmha_bwd_dv_kernel_wmma, grid, dim3(BLOCK_SIZE), 0, 0, d_P, d_dO, d_result, M, N, K_dim);
+    hipDeviceSynchronize();
+
+    bhalf_t h_result[N*K_dim];
+    hipMemcpy(h_result, d_result, N*K_dim*sizeof(bhalf_t), hipMemcpyDeviceToHost);
+
+    printf("dV kernel result[0..3]: %.4f %.4f %.4f %.4f\n",
+           static_cast<float>(h_result[0]), static_cast<float>(h_result[1]),
+           static_cast<float>(h_result[2]), static_cast<float>(h_result[3]));
+    printf("Expected: -32.0 (M=64 * 1.0 * -0.5)\n");
+
+    hipFree(d_P); hipFree(d_dO); hipFree(d_result);
+    return 0;
 }

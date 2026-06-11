@@ -1,6 +1,7 @@
 #pragma once
 #include <hip/hip_runtime.h>
 #include <rocwmma/rocwmma.hpp>
+#include "fmha_bwd_config.h"
 
 using half_t = _Float16;
 using bhalf_t = rocwmma::bfloat16_t;
@@ -15,11 +16,11 @@ __global__ void fmha_bwd_dq_kernel_naive(const half_t* dS, const half_t* K, half
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int m = idx / K_dim;
     int k = idx % K_dim;
-    
+
     if (m < M && k < K_dim) {
         float sum = 0.0f;
         for (int n = 0; n < N; ++n) {
-            sum += static_cast<float>(dS[m * N + n]) * 
+            sum += static_cast<float>(dS[m * N + n]) *
                    static_cast<float>(K[n * K_dim + k]);
         }
         dQ[m * K_dim + k] = static_cast<half_t>(sum);
@@ -29,13 +30,11 @@ __global__ void fmha_bwd_dq_kernel_naive(const half_t* dS, const half_t* K, half
 // ============================================================
 // WMMA-optimized kernel: dQ = dS @ K
 // M x N  (dS)  x  N x K_dim (K)  ->  M x K_dim (dQ)
-// 
+//
 // Tile layout: BM blocks along M, BN blocks along N dimension of dS/K
 // BK is the inner dimension chunk size for WMMA.
 // Warp mapping: warp_m = warp_id % num_warp_rows, warp_k = warp_id / num_warp_rows
 // ============================================================
-
-constexpr int BM = 64, BN = 64, BK = 32, LDS_PAD = 8, BLOCK_SIZE = 512;
 
 __global__ void fmha_bwd_dq_kernel_wmma(
     const bhalf_t* dS, const bhalf_t* K, bhalf_t* dQ,
@@ -45,25 +44,25 @@ __global__ void fmha_bwd_dq_kernel_wmma(
     __shared__ bhalf_t s_K[BK][BN + LDS_PAD];
 
     using FragA = rocwmma::fragment<rocwmma::matrix_a, 16, 16, 16, bhalf_t, rocwmma::row_major>;
-    using FragB = rocwmma::fragment<rocwmma::matrix_b, 16, 16, 16, bhalf_t, rocwmma::row_major>;
-    using FragC = rocwmma::fragment<rocwmma::accumulator, 16, 16, 16, float>;
-    using FragOut = rocwmma::fragment<rocwmma::accumulator, 16, 16, 16, bhalf_t>;
+    using FragB = rocwmma::fragment<rocwmma::matrix_b, 16, 16, 16, bhalf_t, rocwmma::col_major>;
+    using FragC = rocwmma::fragment<accumulator, 16, 16, 16, float>;
+    using FragOut = rocwmma::fragment<accumulator, 16, 16, 16, bhalf_t>;
 
     int block_m = blockIdx.y;
     int block_k = blockIdx.x;
-    
+
     int tid = threadIdx.x;
-    int warp_id = tid / 64;  // 8 warps per block (512/64)
+    int warp_id   = tid / WARP_SIZE;  // 8 warps per block (512/64)
     int warp_m_idx = warp_id % 4;
     int warp_k_idx = warp_id / 4;
-    
+
     int m_start = block_m * BM;
     int k_start = block_k * BN;
     int w_m_start = m_start + warp_m_idx * 16;
     int w_k_start = k_start + warp_k_idx * 16;
 
     // ---- Load dS tile into shared memory (full tile broadcast) ----
-    for (int i = tid; i < BM * BN; i += blockDim.x) {
+    for (int i = tid; i < BM * BN; i += BLOCK_SIZE) {
         int m = i / BN, n = i % BN;
         int gm = m_start + m;
         if (gm < M_global && n < N_global) {
@@ -80,10 +79,10 @@ __global__ void fmha_bwd_dq_kernel_wmma(
 
     for (int n_start = 0; n_start < N_global; n_start += BK) {
         // Load K slice into shared memory
-        for (int i = tid; i < BK * BN; i += blockDim.x) {
+        for (int i = tid; i < BK * BN; i += BLOCK_SIZE) {
             int k_idx = i / BN, n = i % BN;
             int gn = n_start + n, gk = k_start + k_idx;
-            s_K[k_idx][n] = (gn < N_global && gk < K_dim_global) 
+            s_K[k_idx][n] = (gn < N_global && gk < K_dim_global)
                             ? K[gn * K_dim_global + gk] : bhalf_t(0.0f);
         }
         __syncthreads();
@@ -92,7 +91,7 @@ __global__ void fmha_bwd_dq_kernel_wmma(
         for (int sub = 0; sub < 2; ++sub) {
             FragA a0;
             FragB b0;
-            
+
             bhalf_t *a_ptr0 = reinterpret_cast<bhalf_t*>(&a0);
             bhalf_t *b_ptr0 = reinterpret_cast<bhalf_t*>(&b0);
 
@@ -112,7 +111,7 @@ __global__ void fmha_bwd_dq_kernel_wmma(
             for (int i = 0; i < 16; ++i) {
                 for (int j = 0; j < 16; ++j) {
                     int k_idx_local = warp_k_idx * 16 + j;
-                    bhalf_t val = (k_idx_local < BK && (n_off + i) < BN) 
+                    bhalf_t val = (k_idx_local < BK && (n_off + i) < BN)
                                   ? s_K[k_idx_local][n_off + i] : bhalf_t(0.0f);
                     // Col-major: transpose during load — KEY for WMMA matrix_b layout
                     b_ptr0[j * 16 + i] = val;

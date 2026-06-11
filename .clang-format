@@ -1,0 +1,61 @@
+Language: Cpp
+BasedOnStyle: LLVM
+AccessModifierOffset: -2
+AlignAfterOpenBracket: Align
+AlignConsecutiveAssignments: false
+AlignEscapedNewlines: Left
+AlignOperands: true
+AllowAllArgumentsOnNextLine: true
+AllowAllConstructorInitLists: false
+AllowAllParametersOfDeclarationOnNextLine: true
+AllowShortBlocksOnASingleLine: Never
+AllowShortCaseLabelsOnASingleLine: false
+AllowShortFunctionsOnASingleLine: None
+AllowShortIfStatementsOnASingleLine: WithoutCondition
+AllowShortLambdasOnASingleLine: All
+AllowShortLoopsOnASingleLine: false
+AlwaysBreakAfterDefinitionReturnType: None
+AlwaysBreakBeforeMultilineStrings: true
+BinPackArguments: true
+BinPackParameters: true
+BraceWrapping:
+  AfterCaseLabel: false
+  AfterClass: true
+  AfterControlStatement: Never
+  AfterEnum: false
+  AfterFunction: true
+  AfterNamespace: false
+  AfterStruct: true
+  AfterUnion: false
+  BeforeCatch: false
+  Else: false
+  If: false
+  While: false
+ColumnLimit: 120
+CompactAddresses: PointerToVariable
+ConstructorInitializerAllOnOneLineOrOnePerLine: true
+ContinuationIndentWidth: 4
+DerivePointerAlignment: false
+DisableFormat: false
+ForEachMacros: [foreach, Q_FOREACH, BOOST_FOREACH]
+IncludeBlocks: Preserve
+IncludeCategories:
+  - Regex: '^<.*\.h>'
+    Priority: 1
+  - Regex: '^<.*>'
+    Priority: 2
+  - Regex: '.*'
+    Priority: 3
+IndentCaseLabels: true
+IndentWidth: 4
+JavaScriptQuotes: Leave
+JavaScriptWrapImport: false
+MaxEmptyLinesToKeep: 1
+NamespaceIndentation: None
+PointerAlignment: Left
+SortIncludes: CaseInsensitive
+SortUsingDeclarations: true
+SpaceAfterCStyleCast: false
+SpaceBeforeAssignmentOperators: true
+SpaceInParens: Never
+Standard: Cpp17
