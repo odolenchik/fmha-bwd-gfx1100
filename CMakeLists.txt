@@ -4,6 +4,9 @@ project(fmha_bwd_hip LANGUAGES CXX HIP)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# ============================================================================
+# Find dependencies
+# ============================================================================
 find_package(hip REQUIRED)
 find_package(rocwmma CONFIG QUIET)
 if(NOT rocwmma_FOUND)
@@ -33,8 +36,18 @@ macro(add_hip_test name src)
     target_compile_options(${name} PRIVATE --offload-arch=gfx1100 -O3 -DROCWMMA_ENABLE_BF16=ON)
 endmacro()
 
-# dQ test — verified working kernel
-add_hip_test(test_dq_final test_dq_final.hip)
+# ============================================================================
+# Install targets
+# ============================================================================
+include(GNUInstallDirs)
 
-# Naive dK reference (no WMMA, just for validation)
-add_hip_test(test_dk_naive test_dk_naive_check.hip)
+install(TARGETS fmha_bwd
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+)
+install(FILES src/fmha_bwd_kernels.hpp DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+install(DIRECTORY src/kernel/correct/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/kernel/correct)
+
+# ============================================================================
+# Testing
+# ============================================================================
+enable_testing()
