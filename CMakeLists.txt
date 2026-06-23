@@ -15,15 +15,26 @@ if(NOT rocwmma_FOUND)
 endif()
 
 # ============================================================================
-# Shared library with all WMMA kernels (HIP source → hipcc)
+# Shared library with all WMMA kernels (BF16 version)
 # ============================================================================
-add_library(fmha_bwd SHARED src/fmha_bwd_kernels.hip)
-set_target_properties(fmha_bwd PROPERTIES HIP_RUNTIME HIP)
-target_include_directories(fmha_bwd PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(fmha_bwd hip::device)
+add_library(fmha_bwd_bf16 SHARED src/fmha_bwd_kernels.hip)
+set_target_properties(fmha_bwd_bf16 PROPERTIES HIP_RUNTIME HIP)
+target_include_directories(fmha_bwd_bf16 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(fmha_bwd_bf16 hip::device)
 
 # Target RDNA3 architecture; enable BF16 math
-target_compile_options(fmha_bwd PRIVATE --offload-arch=gfx1100 -O3 -DROCWMMA_ENABLE_BF16=ON)
+target_compile_options(fmha_bwd_bf16 PRIVATE --offload-arch=gfx1100 -O3 -DROCWMMA_ENABLE_BF16=ON)
+
+# ============================================================================
+# Shared library with all FP16 kernels (alternative version)
+# ============================================================================
+add_library(fmha_bwd_fp16 SHARED src/fmha_bwd_kernels_fp16.hip)
+set_target_properties(fmha_bwd_fp16 PROPERTIES HIP_RUNTIME HIP)
+target_include_directories(fmha_bwd_fp16 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(fmha_bwd_fp16 hip::device)
+
+# Target RDNA3 architecture for FP16 (no special flags needed for FP16)
+target_compile_options(fmha_bwd_fp16 PRIVATE --offload-arch=gfx1100 -O3)
 
 # ============================================================================
 # Test executables (HIP source → hipcc, link hip::device only)
