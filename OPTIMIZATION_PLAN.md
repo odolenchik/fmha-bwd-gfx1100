@@ -98,12 +98,12 @@ The following steps are to be applied iteratively. After each change, re‑run t
 - **Current:** naïve element‑wise, each thread computes one output dot product over K.  
 - **Optimization:**
   1. **Tile size:** Choose `TM × TN` (e.g., 64×64) matching shared‑memory capacity.  
-  2. Load a tile of dO `[TM × TK]` and V `[TN × TK]` into shared memory (using `__half2` loads).  
-  3. Compute partial dot products inside the tile, accumulate to registers.  
-  4. Loop over K in chunks of TK.  
-  5. Use vectorized loads (`half2` or `half4`) for coalesced reads.  
-  6. Apply `__ldg` for dO and V pointers.  
-  7. After computing tile, store to dP with coalesced writes.  
+  2 Load a tile of dO `[TM × TK]` and V `[TN × TK]` into shared memory (using `__half2` loads).  
+  3 Compute partial dot products inside the tile, accumulate to registers.  
+  4 Loop over K in chunks of TK.  
+  5 Use vectorized loads (`half2` or `half4`) for coalesced reads.  
+  6 Apply `__ldg` for dO and V pointers.  
+  7 After computing tile, store to dP with coalesced writes.  
 - **Shared memory requirement:** `sizeof(half)*(TM*TK + TN*TK)`. With TM=TN=64, TK=32 → 2*64*32*2 = 8 KB (fits comfortably).  
 - **Expected OI:** roughly `(2*TK) / (2*TK*sizeof + 2*TK*sizeof) ≈ 0.5 * (TK/2)` → with TK=32 gives ~8 FLOP/Byte (improves 16×).
 
@@ -160,6 +160,56 @@ After each modification:
 3. Compare outputs against PyTorch reference using the benchmark’s diff reporting (max absolute difference).  
 4. If any test fails, inspect the offending kernel with `rocgdb` or add debug prints (`printf`) guarded by a compile‑time flag.
 
+## 5. Correctness Assurance (Best‑Practice Checklist)
+
+To guarantee that optimizations do **not** silently break numerical correctness, follow this incremental verification workflow after **every** code change:
+
+1. **Preserve a reference implementation**  
+   - Keep the original naïve kernels (e.g., in `src/fmha_bwd_kernels_naive.hip`).  
+   - After each change, compile both the naïve and the optimized versions.
+
+2. **Use a high‑precision oracle**  
+   - Compute the expected result in FP32 (or FP64) on CPU or via a separate HIP kernel that accumulates in FP32.  
+   - Compare the optimized BF16/FP16 output **against this FP32 reference**, allowing only a small error (e.g., ≤ 1 ULP for BF16 ≈ 0.001, ≤ 2 ULP for FP16 ≈ 0.0005).  
+   - This catches loss of precision from reduced‑precision accumulators.
+
+3. **Automated unit‑ and integration tests**  
+   - Existing `test_*_isolated.py` and `test_integration.py` already compare against PyTorch (FP32→BF16).  
+   - Keep the tolerances tight (`rtol=1e-3, atol=1e-3` for BF16) and treat any failure as a blocker.
+
+4. **Intermediate‑buffer diff**  
+   - Save the intermediate tensors (`dP`, `dS`, `dQ`, `dK`, `dV`) from both naïve and optimized kernels to host memory (or to files).  
+   - Perform element‑wise `allclose` checks.  
+   - If an intermediate buffer differs, the error is localized to that kernel; otherwise the problem lies later in the pipeline.
+
+5. **Deterministic seeding & fixed problem sizes**  
+   - In all test scripts fix `np.random.seed(42)` and `torch.manual_seed(42)`.  
+   - Run the naïve and optimized kernels back‑to‑back on the **exact same** input tensors to eliminate scheduler nondeterminism.
+
+6. **Optional intra‑kernel debug prints**  
+   - Guard `printf` statements with `#if DEBUG` to log a few values (e.g., first warp’s accumulator) from both kernels; compare logs visually or via a script.
+
+7. **Compiler flag hygiene**  
+   - Avoid `-ffast-math` (or similar) on stages where the order of reductions matters.  
+   - If you need fast math for performance, build two variants: a “strict” version (no fast‑math) for verification and a “fast” version for benchmarking; only promote the fast version if the strict‑vs‑fast diff stays within the tolerated ULP range.
+
+8. **Leverage AMD debugging tools**  
+   - **rocgdb**: set breakpoints at kernel entry/exit, inspect register values or shared memory in a few warps to verify no race conditions.  
+   - **amdllpc -dis**: review the generated ISA for unintended spills or extra moves that could alter precision.  
+   - **Kernel Analyzer (via rocprofiler --kernel-stat)**: look for abnormal numbers of `s_waitcnt` (indicates unnecessary stalls from missing `__syncthreads()`).  
+   - **rocprofiler --memory-traces**: confirm that global loads are truly coalesced (addresses increasing by 128 bytes per wavefront).  
+   - **omnitrace**: verify that host‑device copies do not unintentionally serialize kernel execution.
+
+9. **Commit granularity & bisect readiness**  
+   - Each logical optimization (e.g., “add tiled shared memory to dp_kernel”, “switch dq_kernel to WMMA”) gets its own commit with a clear message.  
+   - If a later commit breaks correctness, use `git bisect` to pinpoint the offending change, fix only that commit, and continue.
+
+10. **CI regression gate**  
+    - Add a step to your CI workflow that after building runs: unit tests, integration test, and a fixed‑size correctness comparison (naïve vs. optimized).  
+    - Any failure blocks merging to `main`.
+
+By adhering to this checklist, you guarantee that every performance improvement is **verified** numerically before moving on, eliminating the risk of silently degraded accuracy.
+
 ---
 
 ## 5. Iterative Workflow
@@ -204,7 +254,7 @@ At the end, we should have a set of optimized kernels whose **combined backward 
 
 1. **Source code** with all optimizations applied (both BF16 and FP16 variants).  
 2. **Updated CMakeLists.txt** (if any new compile flags or sources added).  
-3. **Performance report** (`PERFORMANCE_RESULTS.md`) containing:
+3. **Performance report** (`PERFORMANCE_RESULTS.md`) containing:  
    - Baseline vs. optimized numbers.  
    - Roofline plots (can be generated with `rocprofiler` data).  
    - Description of remaining bottlenecks (if any).  
@@ -228,7 +278,7 @@ At the end, we should have a set of optimized kernels whose **combined backward 
 
 ---
 
-### Conclusion
+## 9. Conclusion
 
 By systematically applying the AMD‑provided profiling and optimization tools (rocprofiler, omnitrace, Kernel Analyzer, llvm-mca, amdllpc, rocgdb, hipGraphs, etc.) and following the transformations outlined above, we can transform the naïve FMHA backward kernels from a **memory‑bound, low‑occupancy** implementation into a **high‑throughput, fused** kernel that approaches the hardware’s roofline limit. The expected outcome is a **significant speedup** (target ≥ 0.8× PyTorch, with potential to match or exceed) together with **reduced memory footprint** and **lower launch overhead**, making the implementation suitable for real‑world LoRA/DoRA training on the Radeon RX 7900 XTX.
 
