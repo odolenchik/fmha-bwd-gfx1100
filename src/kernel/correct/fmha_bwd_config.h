@@ -21,3 +21,7 @@ constexpr int BK       = 32;    // K-dimension WMMA chunk size
 constexpr int WARP_SIZE     = 64;
 constexpr int BLOCK_SIZE    = 512;   // 8 warps per thread block
 constexpr int LDS_PAD       = 8;    // shared-memory padding to avoid bank conflicts
+
+// Maximum number of heads to process per kernel launch (for head tiling)
+// Set empirically based on register pressure and occupancy requirements
+constexpr int MAX_HEADS_PER_LAUNCH = 64;

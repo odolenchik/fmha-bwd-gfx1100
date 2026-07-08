@@ -52,7 +52,7 @@ endmacro()
 # ============================================================================
 include(GNUInstallDirs)
 
-install(TARGETS fmha_bwd
+install(TARGETS fmha_bwd_bf16 fmha_bwd_fp16
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
 )
 install(FILES src/fmha_bwd_kernels.hpp DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
