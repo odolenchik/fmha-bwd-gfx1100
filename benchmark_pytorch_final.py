@@ -27,7 +27,7 @@ print(f"Device: {DEVICE}  (HIP={HAS_HIP})")
 # ============================================================================
 # Load the shared library
 # ============================================================================
-lib = ctypes.CDLL('./build/libfmha_bwd.so')
+lib = ctypes.CDLL('./build/libfmha_bwd_bf16.so')
 
 lib.fmha_bwd_full_py.argtypes = [
     ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
