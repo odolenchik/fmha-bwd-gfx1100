@@ -347,17 +347,37 @@ __global__ void dk_kernel(const bhalf_t* dS, const bhalf_t* Q, bhalf_t* dK,
 }
 
 // ============================================================================
-// dV = P^T @ dO — naive element-per-thread with head tiling
+// WMMA dV = P^T @ dO — optimized for GFX1100 with head tiling
+// P: [M x N] row-major, dO: [M x K_dim] row-major -> dV: [N x K_dim] row-major
 // dV[n][k] = sum_{m=0}^{M-1} P[m][n] * dO[m][k]
-// Each thread computes a subset of output elements (N × K_dim).
-// Supports head tiling via head_start parameter.
+// Each block computes one BN x BK tile of output.
+// Grid: x = ceil(K_dim / BK), y = ceil(N / BN), z = ceil(heads / MAX_HEADS_PER_LAUNCH)
 // ============================================================================
 __global__ void dv_kernel(const bhalf_t* P, const bhalf_t* dO, bhalf_t* dV,
                           int M_global, int N_global, int K_dim_global, int total_heads, int head_start) {
+    __shared__ bhalf_t s_P[BN][BM + LDS_PAD];   // transposed: s_P[n_local][m_local] = P[m_local][n_start+n_local]
+    __shared__ bhalf_t s_dO[BK + LDS_PAD][BM];  // dO slice: s_dO[k_idx_local][m_idx]
+
+    using FragA = rocwmma::fragment<rocwmma::matrix_a, 16, 16, 16, bhalf_t, rocwmma::row_major>;
+    using FragB = rocwmma::fragment<rocwmma::matrix_b, 16, 16, 16, bhalf_t, rocwmma::col_major>;
+    using FragC = rocwmma::fragment<rocwmma::accumulator, 16, 16, 16, float>;
+    using FragOut = rocwmma::fragment<rocwmma::accumulator, 16, 16, 16, bhalf_t>;
+
     int head_idx_base = blockIdx.z * MAX_HEADS_PER_LAUNCH + head_start;
     if (head_idx_base >= total_heads) return;
 
     int tid = threadIdx.x;
+    int warp_id   = tid / WARP_SIZE;     // 8 warps per block (512/64)
+    int warp_n_idx = warp_id % 4;        // N sub-tile (16-wide each, 4 across)
+    int warp_k_idx = warp_id / 4;        // K sub-tile (16-wide each, 2 down)
+
+    int block_n = blockIdx.x;            // which BN tile in N
+    int block_k = blockIdx.y;            // which BK tile in K_dim
+
+    int n_start = block_n * BN;
+    int k_start = block_k * BK;
+    int w_n_start = n_start + warp_n_idx * 16;
+    int w_k_start = k_start + warp_k_idx * 16;
 
     // Loop over heads assigned to this block
     for (int head_offset = 0; head_offset < MAX_HEADS_PER_LAUNCH; ++head_offset) {
@@ -368,22 +388,83 @@ __global__ void dv_kernel(const bhalf_t* P, const bhalf_t* dO, bhalf_t* dV,
         const bhalf_t* dO_h  = dO + head_idx * M_global * K_dim_global;
         bhalf_t*       dV_h  = dV + head_idx * N_global * K_dim_global;
 
-        // Each thread computes a subset of output elements
-        // Total output elements per head: N_global * K_dim_global
-        int total_elements = N_global * K_dim_global;
-        for (int idx = tid; idx < total_elements; idx += BLOCK_SIZE) {
-            int n = idx / K_dim_global;
-            int k = idx % K_dim_global;
-
-            float sum = 0.0f;
-            for (int m = 0; m < M_global; ++m) {
-                bhalf_t p_val  = P_h[m * N_global + n];
-                bhalf_t do_val = dO_h[m * K_dim_global + k];
-                sum += static_cast<float>(p_val) * static_cast<float>(do_val);
-            }
-
-            dV_h[n * K_dim_global + k] = static_cast<bhalf_t>(sum);
+        // ---- Load P transposed into shared memory: s_P[n][m] = P[m][n] ----
+        for (int i = tid; i < BM * BN; i += BLOCK_SIZE) {
+            int n_local = i / BM, m_local = i % BM;  // [BN x BM] layout
+            s_P[n_local][m_local] = (n_start + n_local < N_global && m_local < M_global)
+                                    ? P_h[m_local * N_global + n_start + n_local] : bhalf_t(0.0f);
         }
+        __syncthreads();
+
+        // ---- WMMA accumulate: dV_tile = P^T @ dO  (loop over M in BM chunks) ----
+        FragC acc;
+        rocwmma::fill_fragment(acc, 0.0f);
+
+        for (int m_start = 0; m_start < M_global; m_start += BM) {
+            int m_chunk = (BM < M_global - m_start) ? BM : (M_global - m_start);
+
+            // Load dO slice into shared memory: s_dO[k_local][m_idx] = dO[m_idx][k_start+k_local]
+            for (int i = tid; i < BK * m_chunk; i += BLOCK_SIZE) {
+                int k_local = i / m_chunk, m_idx = i % m_chunk;
+                s_dO[k_local][m_idx] = (k_start + k_local < K_dim_global && m_start + m_idx < M_global)
+                                       ? dO_h[(m_start + m_idx) * K_dim_global + k_start + k_local]
+                                       : bhalf_t(0.0f);
+            }
+            __syncthreads();
+
+            // WMMA: process 16x16 sub-tiles over M dimension (BM=64 -> 4 iterations of 16)
+            for (int m_sub = 0; m_sub < 4; ++m_sub) {
+                FragA a_frag;
+                FragB b_frag;
+
+                bhalf_t *a_ptr = reinterpret_cast<bhalf_t*>(&a_frag);
+                bhalf_t *b_ptr = reinterpret_cast<bhalf_t*>(&b_frag);
+
+                int m_off = m_sub * 16;
+
+                // Fill A fragment from P^T (row-major: n=rows, m=cols)
+                for (int i = 0; i < 16; ++i) {
+                    int n_local = warp_n_idx * 16 + i;
+                    for (int j = 0; j < 16 && (m_off + j) < m_chunk; ++j) {
+                        bhalf_t val = (n_local < BN && (m_off + j) < BM)
+                                      ? s_P[n_local][m_off + j] : bhalf_t(0.0f);
+                        a_ptr[i * 16 + j] = val;
+                    }
+                }
+
+                // Fill B fragment from dO slice (col-major transpose for WMMA matrix_b layout)
+                for (int i = 0; i < 16 && (m_off + i) < m_chunk; ++i) {
+                    for (int j = 0; j < 16; ++j) {
+                        int k_idx_local = warp_k_idx * 16 + j;
+                        bhalf_t val = ((m_off + i) < BM && k_idx_local < BK)
+                                      ? s_dO[k_idx_local][m_off + i] : bhalf_t(0.0f);
+                        b_ptr[j * 16 + i] = val;
+                    }
+                }
+
+                rocwmma::mma_sync(acc, a_frag, b_frag, acc);
+            }
+            __syncthreads();  // ensure next dO slice load is visible
+        }
+
+        // ---- Write back results: dV[n][k] from accumulator ----
+        if (w_n_start < N_global && w_k_start < K_dim_global) {
+            FragOut out;
+            for (int i = 0; i < acc.num_elements; ++i) {
+                out.x[i] = static_cast<bhalf_t>(acc.x[i]);
+            }
+            for (int i = 0; i < 16; ++i) {
+                int n_local = w_n_start + i;
+                for (int j = 0; j < 16; ++j) {
+                    int k_idx = w_k_start + j;
+                    if (n_local < N_global && k_idx < K_dim_global) {
+                        dV_h[n_local * K_dim_global + k_idx] = out.x[i * 16 + j];
+                    }
+                }
+            }
+        }
+
+        __syncthreads();  // clean shared memory for next head
     }
 }
 
