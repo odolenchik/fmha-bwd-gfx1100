@@ -5,15 +5,17 @@ High-performance FlashAttention backward kernels for AMD Radeon RX 7900 XTX (RDN
 
 ---
 
-## Current State (Post-Audit)
+## Current State (Post-Audit, 2026-07-29)
 
 **Production file**: `src/fmha_bwd_kernels.hip` — BF16 kernels with multi-head support
 - ✅ Build system works (CMake → `libfmha_bwd_bf16.so`, `libfmha_bwd_fp16.so`)
 - ✅ `dp_kernel`, `softmax_bwd_kernel` — naive but functional
 - ❌ `dq_kernel`, `dk_kernel`, `dv_kernel` — **still naive element-per-thread** (NOT WMMA!)
-- ✅ Reference WMMA implementations exist in `src/kernel/correct/` (verified working)
+- ✅ Reference WMMA implementations exist in `src/kernel/correct/` (verified working with 0.0 diff)
 
 **Key Issue**: The optimized WMMA kernels for dQ/dK/dV are sitting in `kernel/correct/` but **not integrated** into the production file.
+
+**Current Blocking Issue**: The `fmha_bwd_full_py` C API has a bug — dQ/dK produce garbage (dV works perfect). Root cause under investigation (intermediate buffer handling / kernel launch config mismatch).
 
 ---
 
@@ -40,6 +42,13 @@ python3 tests/test_dv_isolated.py
 python3 tests/test_integration.py
 python3 benchmark_pytorch_final.py
 ```
+
+### Task 1.4: Fix `fmha_bwd_full_py` C API bug
+**Current blocker**: dQ/dK produce garbage in full API (dV works). Debug steps:
+1. ✅ Verified test wrappers + explicit sync work correctly (max diff 0.03)
+2. ✅ Verified kernel launch configs match between test wrappers and full API
+3. ❌ Full API `fmha_bwd_full_py` gives dQ/dK garbage (dV perfect)
+4. Next: Add debug instrumentation to capture intermediate `dS` after softmax in full API
 
 ---
 
@@ -113,5 +122,5 @@ hipGraphLaunch(graphExec, 0);
 
 ---
 
-## Next Action
-**Start Phase 1 Task 1.1**: Replace the three naive kernels in `src/fmha_bwd_kernels.hip` with their WMMA counterparts from `src/kernel/correct/`, adding head tiling support.
+## Next Action (IMMEDIATE)
+**Debug and fix `fmha_bwd_full_py` C API**: Add debug instrumentation to capture intermediate `dS` after softmax in the full C API, compare with test-wrapper-sequence results to isolate the kernel/dP/dS handling difference. Once fixed, proceed with Phase 1 Task 1.1 (WMMA integration).
